@@ -189,8 +189,47 @@ where
 pub fn loss_curve(
     losses: &[f64],
     output_file: &str,
+    threshold: Option<f64>,
 ) -> std::io::Result<()> {
     let epochs: Vec<usize> = (0..losses.len()).collect();
+    
+    // Calculate approximate derivative (gradient) of loss
+    let mut loss_derivatives = Vec::new();
+    for i in 1..losses.len() {
+        let derivative = losses[i] - losses[i-1];
+        loss_derivatives.push(derivative);
+    }
+    let derivative_epochs: Vec<usize> = (1..losses.len()).collect();
+    
+    // Remove outliers from derivatives using IQR method
+    let mut sorted_derivatives = loss_derivatives.clone();
+    sorted_derivatives.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    
+    let q1_idx = sorted_derivatives.len() / 4;
+    let q3_idx = 3 * sorted_derivatives.len() / 4;
+    let q1 = sorted_derivatives[q1_idx];
+    let q3 = sorted_derivatives[q3_idx];
+    let iqr = q3 - q1;
+    let lower_bound = q1 - 1.5 * iqr;
+    let upper_bound = q3 + 1.5 * iqr;
+    
+    // Clamp outliers to bounds
+    let filtered_derivatives: Vec<f64> = loss_derivatives.iter()
+        .map(|&d| d.max(lower_bound).min(upper_bound))
+        .collect();
+    
+    // Also create a version that skips the first few epochs to avoid initial instability
+    let skip_initial = 10.min(losses.len() / 10); // Skip first 10 epochs or 10% of data
+    let stable_derivatives: Vec<f64> = filtered_derivatives.iter()
+        .skip(skip_initial)
+        .cloned()
+        .collect();
+    let stable_epochs: Vec<usize> = derivative_epochs.iter()
+        .skip(skip_initial)
+        .cloned()
+        .collect();
+    
+    let threshold_value = threshold.unwrap_or(1e-5);
     
     // Create HTML with embedded Chart.js for loss curve
     let html_content = format!(r#"
@@ -206,21 +245,27 @@ pub fn loss_curve(
             background: #f5f5f5;
         }}
         .container {{ 
-            max-width: 1000px; 
+            max-width: 1200px; 
             margin: auto;
             background: white;
             padding: 20px;
             border-radius: 8px;
             box-shadow: 0 2px 10px rgba(0,0,0,0.1);
         }}
+        .charts {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 20px;
+        }}
         canvas {{ 
             max-width: 100%; 
-            height: 400px;
+            height: 350px;
         }}
         .stats {{
             display: grid;
-            grid-template-columns: 1fr 1fr 1fr;
-            gap: 20px;
+            grid-template-columns: 1fr 1fr 1fr 1fr 1fr;
+            gap: 15px;
             margin-top: 20px;
         }}
         .stat-box {{
@@ -233,8 +278,18 @@ pub fn loss_curve(
 </head>
 <body>
     <div class="container">
-        <h1>Training Loss Curve</h1>
-        <canvas id="lossChart"></canvas>
+        <h1>Training Loss Analysis</h1>
+        
+        <div class="charts">
+            <div>
+                <h3>Loss Curve</h3>
+                <canvas id="lossChart"></canvas>
+            </div>
+            <div>
+                <h3>Loss Derivative (Filtered, Stable Period)</h3>
+                <canvas id="derivativeChart"></canvas>
+            </div>
+        </div>
         
         <div class="stats">
             <div class="stat-box">
@@ -246,8 +301,16 @@ pub fn loss_curve(
                 <p id="finalLoss">Calculating...</p>
             </div>
             <div class="stat-box">
+                <h3>Stable Avg Gradient</h3>
+                <p id="avgGradient">Calculating...</p>
+            </div>
+            <div class="stat-box">
                 <h3>Total Epochs</h3>
                 <p id="totalEpochs">{epochs_count}</p>
+            </div>
+            <div class="stat-box">
+                <h3>Outliers Filtered</h3>
+                <p id="outliersFiltered">Calculating...</p>
             </div>
         </div>
     </div>
@@ -255,17 +318,30 @@ pub fn loss_curve(
     <script>
         const epochs = {epochs:?};
         const losses = {losses:?};
+        const stableEpochs = {stable_epochs:?};
+        const stableDerivatives = {stable_derivatives:?};
+        const allDerivatives = {filtered_derivatives:?};
         
         // Calculate statistics
         const initialLoss = losses[0];
         const finalLoss = losses[losses.length - 1];
         const totalEpochs = losses.length;
+        const avgGradient = stableDerivatives.reduce((a, b) => a + b, 0) / stableDerivatives.length;
+        
+        // Count outliers that were filtered
+        const originalDerivatives = {loss_derivatives:?};
+        const outliersCount = originalDerivatives.filter((d, i) => 
+            Math.abs(d - allDerivatives[i]) > 1e-10
+        ).length;
         
         document.getElementById('initialLoss').textContent = initialLoss.toFixed(6);
         document.getElementById('finalLoss').textContent = finalLoss.toFixed(6);
+        document.getElementById('avgGradient').textContent = avgGradient.toFixed(6);
+        document.getElementById('outliersFiltered').textContent = outliersCount;
         
-        const ctx = document.getElementById('lossChart').getContext('2d');
-        new Chart(ctx, {{
+        // Loss curve chart
+        const lossCtx = document.getElementById('lossChart').getContext('2d');
+        new Chart(lossCtx, {{
             type: 'line',
             data: {{
                 labels: epochs,
@@ -316,10 +392,75 @@ pub fn loss_curve(
                 }}
             }}
         }});
+        
+        // Derivative chart
+        const derivCtx = document.getElementById('derivativeChart').getContext('2d');
+        new Chart(derivCtx, {{
+            type: 'line',
+            data: {{
+                labels: stableEpochs,
+                datasets: [
+                    {{
+                        label: 'Loss Change',
+                        data: stableDerivatives,
+                        borderColor: 'rgb(255, 99, 132)',
+                        backgroundColor: 'rgba(255, 99, 132, 0.1)',
+                        borderWidth: 2,
+                        fill: true,
+                        pointRadius: 1,
+                        pointHoverRadius: 4,
+                        tension: 0.1
+                    }},
+                    {{
+                        label: 'Convergence Threshold',
+                        data: Array(stableEpochs.length).fill({threshold_value}),
+                        borderColor: 'rgb(255, 165, 0)',
+                        backgroundColor: 'rgba(255, 165, 0, 0.1)',
+                        borderWidth: 2,
+                        fill: false,
+                        pointRadius: 0,
+                        borderDash: [10, 5]
+                    }}
+                ]
+            }},
+            options: {{
+                responsive: true,
+                plugins: {{
+                    title: {{
+                        display: true,
+                        text: 'Loss Gradient (Δloss/Δepoch)'
+                    }},
+                    legend: {{
+                        display: true,
+                        position: 'top'
+                    }}
+                }},
+                scales: {{
+                    y: {{
+                        title: {{
+                            display: true,
+                            text: 'Loss Change'
+                        }}
+                    }},
+                    x: {{
+                        title: {{
+                            display: true,
+                            text: 'Epoch'
+                        }}
+                    }}
+                }},
+                interaction: {{
+                    intersect: false,
+                    mode: 'index'
+                }}
+            }}
+        }});
     </script>
 </body>
 </html>
-"#, epochs = epochs, losses = losses, epochs_count = losses.len());
+"#, epochs = epochs, losses = losses, epochs_count = losses.len(), 
+    stable_epochs = stable_epochs, stable_derivatives = stable_derivatives,
+    filtered_derivatives = filtered_derivatives, loss_derivatives = loss_derivatives);
 
     let mut file = File::create(output_file)?;
     file.write_all(html_content.as_bytes())?;
